@@ -8,3 +8,5 @@ pandas
 python-dotenv
 flask
 flask-cors
+matplotlib
+seaborn

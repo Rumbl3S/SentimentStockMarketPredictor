@@ -70,6 +70,23 @@ Example request body:
 3. Optional API base override:
    - create `frontend/.env` with `VITE_API_BASE_URL=http://localhost:8000`
 
+## Analysis Graph Scripts
+
+Generate synthetic test data (enough volume for meaningful distributions/clusters):
+
+`python analysis/generate_test_data.py --output-dir analysis/data --seed 42`
+
+Create all five analysis graphs:
+
+`python analysis/plot_graphs.py --data-dir analysis/data --output-dir analysis/plots --similarity-floor 0.35`
+
+Outputs:
+- `analysis/plots/1_finbert_sentiment_distribution.png`
+- `analysis/plots/2_similarity_floor_distribution.png`
+- `analysis/plots/3_embedding_clusters_pca.png`
+- `analysis/plots/4_rf_feature_importances.png`
+- `analysis/plots/5_semantic_vs_sentiment_scatter.png`
+
 ## Pipeline Architecture (7 Steps)
 
 1. Read user query and ticker list.
