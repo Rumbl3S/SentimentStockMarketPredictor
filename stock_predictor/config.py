@@ -11,8 +11,8 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 MARKETAUX_BASE_URL = "https://api.marketaux.com/v1"
-DEFAULT_TOP_K = 3
-HISTORICAL_DAYS = 180
+DEFAULT_TOP_K = 5
+HISTORICAL_DAYS = 730
 FREE_TIER_LIMIT_PER_REQUEST = 3
 FREE_TIER_DAILY_REQUESTS = 100
 
