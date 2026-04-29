@@ -26,6 +26,11 @@ def get_api_request_count() -> int:
     return API_REQUEST_COUNT
 
 
+def reset_api_request_count() -> None:
+    global API_REQUEST_COUNT
+    API_REQUEST_COUNT = 0
+
+
 def fetch_articles_for_ticker(
     ticker: str, search_keywords: list[str], num_pages: int = 3, top_k: int = 3
 ) -> list[dict[str, Any]]:

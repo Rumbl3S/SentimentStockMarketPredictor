@@ -1,6 +1,11 @@
 # ML-Powered Stock Sentiment and Prediction Pipeline
 
-This project is a Python CLI application that takes a natural-language market question plus stock tickers, fetches ticker-specific news from MarketAux, ranks articles by query relevance with TF-IDF + cosine similarity, analyzes sentiment with FinBERT, engineers price features from Yahoo Finance, and predicts next-5-day direction and magnitude using Random Forest + Linear Regression.
+This project includes:
+- A Python CLI pipeline for stock sentiment and price-direction prediction.
+- A lightweight Flask API (`/api/predict`) exposing the same pipeline.
+- A React frontend with two interfaces:
+  - input page for model parameters
+  - transparency-focused results page showing ranking, sentiment, and blend math
 
 ## Setup
 
@@ -19,17 +24,68 @@ Create a free account at [MarketAux](https://www.marketaux.com/) and copy your A
 
 ## Usage
 
+### CLI
+
 Interactive mode:
 
 `python main.py`
 
 Direct CLI args:
 
-`python main.py --query "How will AI chip demand affect semiconductor stocks?" --tickers "NVDA,TSM,INTC" --top-k 5 --pages 3 --history-days 60`
+`python main.py --query "How will AI chip demand affect semiconductor stocks?" --tickers "NVDA,TSM,INTC" --pages 3 --history-days 60`
 
 Optional clustering bonus:
 
 `python main.py --query "How will tariffs affect chipmakers?" --tickers "NVDA,AMD,INTC" --cluster`
+
+### API
+
+Run backend API:
+
+`python api_server.py`
+
+Endpoints:
+- `GET /api/health`
+- `POST /api/predict`
+
+Example request body:
+
+```json
+{
+  "query": "How will AI chip demand affect semiconductor stocks?",
+  "tickers": "NVDA,TSM,INTC",
+  "pages": 3,
+  "historyDays": 180,
+  "cluster": true
+}
+```
+
+### Frontend
+
+1. Install frontend dependencies:
+   - `cd frontend`
+   - `npm install`
+2. Start frontend:
+   - `npm run dev`
+3. Optional API base override:
+   - create `frontend/.env` with `VITE_API_BASE_URL=http://localhost:8000`
+
+## Analysis Graph Scripts
+
+Generate synthetic test data (enough volume for meaningful distributions/clusters):
+
+`python analysis/generate_test_data.py --output-dir analysis/data --seed 42`
+
+Create all five analysis graphs:
+
+`python analysis/plot_graphs.py --data-dir analysis/data --output-dir analysis/plots --similarity-floor 0.35`
+
+Outputs:
+- `analysis/plots/1_finbert_sentiment_distribution.png`
+- `analysis/plots/2_similarity_floor_distribution.png`
+- `analysis/plots/3_embedding_clusters_pca.png`
+- `analysis/plots/4_rf_feature_importances.png`
+- `analysis/plots/5_semantic_vs_sentiment_scatter.png`
 
 ## Pipeline Architecture (7 Steps)
 
