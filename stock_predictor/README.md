@@ -14,9 +14,18 @@ This project includes:
    - `source .venv/bin/activate`
 2. Install dependencies:
    - `pip install -r requirements.txt`
-3. Build the local dataset first:
-   - `./.venv/bin/python build_local_dataset.py --ticker-source all --years 8 --rss-lookback-days 3650`
+3. Build the local dataset first (Polars pipelines + RSS + Yahoo).
+   - **Important:** `main.py` / the API only load news for **the tickers the user types**. The slow step is **`build_local_dataset.py`**, which pre-fetches RSS + prices for the **universe** you choose.
+   - **Defaults are tuned for a quick build** (~tens of minutes on a typical connection): `seed` (~90 tickers), **5 years** of prices, **365-day** RSS window, **2** RSS query templates per ticker, **6** parallel Yahoo workers. Example:
+     - `./.venv/bin/python build_local_dataset.py`
+   - **Heavier / older-style full S&P + long lookback** (much longer):
+     - `./.venv/bin/python build_local_dataset.py --ticker-source sp500 --years 8 --rss-lookback-days 3650 --rss-query-templates 5`
+   - Full SEC list: `--ticker-source company_json` (optionally `--max-tickers 200` for a smoke build).
 4. (Optional) copy `.env.example` to `.env` for local overrides.
+
+## Data stack: Polars (not pandas)
+
+Tabular work in this repo uses **Polars** for I/O, joins, group-bys, and feature engineering. Yahoo Finance still returns a pandas object internally; we immediately copy **Open/High/Low/Close/Volume** into Polars so the project’s own logic stays in Polars end-to-end. `yfinance` may still install pandas as a transitive dependency, but **application code** uses Polars for tables.
 
 ## Usage
 
@@ -28,9 +37,9 @@ Interactive mode:
 
 Direct CLI args:
 
-`python main.py --query "How will AI chip demand affect semiconductor stocks?" --tickers "NVDA,TSM,INTC" --pages 3 --history-days 60`
+`python main.py --query "How will AI chip demand affect semiconductor stocks?" --tickers "NVDA,TSM,INTC" --pages 3 --history-days 180`
 
-Optional clustering bonus:
+Optional clustering:
 
 `python main.py --query "How will tariffs affect chipmakers?" --tickers "NVDA,AMD,INTC" --cluster`
 
@@ -66,9 +75,9 @@ Example request body:
 3. Optional API base override:
    - create `frontend/.env` with `VITE_API_BASE_URL=http://localhost:8000`
 
-## Analysis Graph Scripts
+## Analysis graph scripts
 
-Generate synthetic test data (enough volume for meaningful distributions/clusters):
+Generate synthetic test data:
 
 `python analysis/generate_test_data.py --output-dir analysis/data --seed 42`
 
@@ -83,30 +92,42 @@ Outputs:
 - `analysis/plots/4_rf_feature_importances.png`
 - `analysis/plots/5_semantic_vs_sentiment_scatter.png`
 
-## Pipeline Architecture (7 Steps)
+## Pipeline architecture (7 steps)
 
 1. Read user query and ticker list.
 2. Extract keywords from the query.
-3. Fetch ticker-specific news from the local processed dataset.
+3. Fetch ticker-specific news from the **local** processed dataset (`news_articles_mapped.csv`).
 4. Rank articles using TF-IDF + cosine similarity.
-5. Run FinBERT sentiment analysis and combine with MarketAux entity sentiment.
-6. Pull historical price data and engineer technical features.
-7. Train per-ticker models and print prediction summaries.
+5. Run FinBERT sentiment and combine with **dataset** keyword/entity-style scores (still labeled `marketaux_avg` in JSON for backward compatibility).
+6. Pull historical price data and engineer technical features (**Polars** in `price_fetcher.py`).
+7. **Preprocess**, **tune hyperparameters** (train only), evaluate with **multiple metrics**, then blend predictions for the summary.
 
-## ML Concepts Used
+## Pre-processing, feature engineering, tuning, and metrics (what improved)
 
-- TF-IDF vectorization
-- Cosine similarity ranking
-- FinBERT transformer-based sentiment (`ProsusAI/finbert`)
-- Random Forest classification (UP/DOWN)
-- Linear Regression (% move magnitude)
-- Feature engineering across NLP + price signals
-- Train/test split and evaluation metrics
+| Area | Before | After |
+|------|--------|--------|
+| **Tables** | pandas-heavy pipelines | **Polars** for build, news read, prices, joins, and aggregations (faster, clearer lazy-friendly patterns, aligns with course “Polars” topic). |
+| **Outliers / heavy tails** | ad hoc `nan_to_num` only | **Winsorization** at the 1st/99th percentile **fit on the training split only**, then applied to train, test, and the live feature row—reduces leverage from extreme returns/volume without peeking at the test split. |
+| **Redundant features** | all columns always used | **Correlation pruning** on the training matrix (drop one column of each pair with \|r\| ≥ 0.95) to reduce multicollinearity before scaling/tuning. |
+| **Scaling** | `StandardScaler` fit on train | unchanged principle: scaling lives **inside** each sklearn `Pipeline` during `RandomizedSearchCV`, so CV folds do not leak statistics from validation folds. |
+| **Hyperparameters** | fixed RF / Ridge | **`RandomizedSearchCV`** on the **training** portion only (time-ordered 70%): RF grid over depth, leaves, `class_weight`, estimators; Ridge over `logspace` alphas. Small training sets fall back to sensible defaults to avoid unstable CV. |
+| **Class imbalance** | ignored | **Report** minority fraction on the training labels; if the minority share is **below 35%**, treat as “severe”: RF search optimizes **F1**, `class_weight` options include **balanced**, and the sentiment blend uses **F1** instead of raw accuracy as the reliability score. |
+| **Metrics** | accuracy + R² only | Still report those, plus **binary F1** for direction (better when UP/DOWN counts differ) and **MAE** for the Ridge target (5-day % move in percentage points—interpretable error size). |
+
+Together, these changes better match typical rubric expectations: explicit preprocessing choices, no standardizer fit on test data, documented imbalance handling, more than one evaluation metric, and methodical hyperparameter search tied to the objective (F1 when imbalanced, negative MAE for regression tuning).
+
+## ML concepts used
+
+- Polars for ETL-style transforms
+- TF-IDF + cosine similarity ranking
+- FinBERT (`ProsusAI/finbert`)
+- Random Forest (direction) + Ridge (magnitude), with **RandomizedSearchCV**
+- Train-only winsorization + correlation pruning + `Pipeline` + `StandardScaler`
 - Optional K-Means article clustering (`--cluster`)
 
-## Limitations and Disclaimer
+## Limitations and disclaimer
 
-- News quality depends on RSS availability and ticker mention extraction.
-- Training windows are small (~40 usable rows per ticker), so predictive power is limited.
-- Sentiment in historical training rows is approximated by current sentiment context for class-project practicality.
+- News quality depends on RSS coverage and ticker/alias matching.
+- Per-ticker **live** training rows depend on `--history-days` and data availability; the README no longer claims a fixed “~40 rows” cap.
+- Historical rows still reuse **current-query** sentiment features for practicality (documented limitation for true walk-forward forecasting).
 - This is a class project and not financial advice.

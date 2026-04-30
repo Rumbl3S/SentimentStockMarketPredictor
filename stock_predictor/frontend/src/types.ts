@@ -54,6 +54,14 @@ export type PriceFeatures = {
   sma_cross: number
 }
 
+export type ClassImbalanceInfo = {
+  n_samples: number
+  positive_count: number
+  negative_count: number
+  minority_class_fraction: number
+  imbalance_severe: boolean
+}
+
 export type Prediction = {
   direction: 'UP' | 'DOWN'
   magnitude_pct: number
@@ -68,7 +76,16 @@ export type Prediction = {
   model_raw_magnitude_pct?: number
   sentiment_magnitude_pct?: number
   rf_accuracy: number | null
+  rf_f1: number | null
   lr_r2: number | null
+  lr_mae: number | null
+  class_imbalance: ClassImbalanceInfo | null
+  preprocessing?: {
+    winsorize: boolean
+    correlation_pruning: boolean
+    dropped_feature_count: number
+    imbalance_severe?: boolean
+  }
   training_samples: number
 }
 

@@ -1,10 +1,4 @@
-"""Generate synthetic but realistic test data for analysis plots.
-
-This script creates:
-- article-level records with sentiment/similarity/embeddings/clusters
-- event+ticker score records for semantic vs sentiment analysis
-- random-forest feature importance records
-"""
+"""Generate synthetic but realistic test data for analysis plots (Polars I/O)."""
 
 from __future__ import annotations
 
@@ -12,7 +6,7 @@ import argparse
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 EVENTS = [
     "AI chip demand surge",
@@ -43,7 +37,6 @@ FEATURES = [
     "relative_strength_5d",
 ]
 
-# Per-event directional drift to create a realistic mix of bullish/bearish contexts.
 EVENT_SENTIMENT_DRIFT = {
     "AI chip demand surge": 0.24,
     "Fed rates hold": 0.02,
@@ -72,7 +65,7 @@ def sentiment_label(score: float) -> str:
     return "Very Bullish"
 
 
-def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pd.DataFrame:
+def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pl.DataFrame:
     cluster_centers = rng.normal(0, 1.0, size=(5, embedding_dim))
     rows: list[dict] = []
     article_id = 1
@@ -83,7 +76,6 @@ def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pd.D
             ticker_bias = rng.normal(0.0, 0.12)
             n_articles = int(rng.integers(12, 25))
             for _ in range(n_articles):
-                # Mixture creates a realistic long-tail for similarity values.
                 if rng.random() < 0.62:
                     similarity = float(rng.beta(7.0, 2.3))
                 else:
@@ -93,8 +85,6 @@ def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pd.D
                 label = sentiment_label(score)
                 cluster_id = int(rng.integers(0, 5))
 
-                # Convert similarity [0,1] to centered semantic signal [-1,1].
-                # Added noise keeps disagreement cases with sentiment.
                 semantic_centered = (2.0 * similarity) - 1.0
                 semantic_score = float(
                     np.clip(semantic_centered + rng.normal(0.0, 0.18), -1.0, 1.0)
@@ -103,7 +93,7 @@ def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pd.D
 
                 embedding = cluster_centers[cluster_id] + rng.normal(0, 0.45, size=embedding_dim)
 
-                row = {
+                row: dict = {
                     "article_id": article_id,
                     "event": event,
                     "ticker": ticker,
@@ -118,34 +108,28 @@ def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pd.D
                     row[f"embedding_{d}"] = float(embedding[d])
                 rows.append(row)
                 article_id += 1
-    return pd.DataFrame(rows)
+    return pl.DataFrame(rows)
 
 
-def aggregate_event_ticker_scores(df_articles: pd.DataFrame) -> pd.DataFrame:
-    grouped = (
-        df_articles.groupby(["event", "ticker"], as_index=False)
-        .agg(
-            semantic_score=("semantic_score_article", "mean"),
-            sentiment_score=("sentiment_score_article", "mean"),
-            avg_similarity=("similarity_score", "mean"),
-            article_count=("article_id", "count"),
-        )
-        .copy()
+def aggregate_event_ticker_scores(df_articles: pl.DataFrame) -> pl.DataFrame:
+    grouped = df_articles.group_by(["event", "ticker"]).agg(
+        pl.col("semantic_score_article").mean().alias("semantic_score"),
+        pl.col("sentiment_score_article").mean().alias("sentiment_score"),
+        pl.col("similarity_score").mean().alias("avg_similarity"),
+        pl.col("article_id").count().alias("article_count"),
     )
-    blended = 0.5 * grouped["semantic_score"] + 0.5 * grouped["sentiment_score"]
-    # Slight positive threshold avoids too many weak-UP classifications near zero.
-    grouped["predicted_direction"] = np.where(blended >= 0.05, "UP", "DOWN")
-    grouped["blended_score"] = blended
-    return grouped
+    blended = 0.5 * pl.col("semantic_score") + 0.5 * pl.col("sentiment_score")
+    return grouped.with_columns(blended.alias("blended_score")).with_columns(
+        pl.when(pl.col("blended_score") >= 0.05).then(pl.lit("UP")).otherwise(pl.lit("DOWN")).alias("predicted_direction"),
+    )
 
 
-def generate_feature_importances(rng: np.random.Generator) -> pd.DataFrame:
-    # Designed to be plausible and interpretable (volatility + relative strength often high).
+def generate_feature_importances(rng: np.random.Generator) -> pl.DataFrame:
     base = np.array([0.07, 0.11, 0.09, 0.22, 0.08, 0.10, 0.08, 0.09, 0.16], dtype=float)
     noise = rng.normal(0.0, 0.015, size=len(base))
     imp = np.clip(base + noise, 0.01, None)
     imp = imp / imp.sum()
-    return pd.DataFrame({"feature": FEATURES, "importance": imp})
+    return pl.DataFrame({"feature": FEATURES, "importance": imp.tolist()})
 
 
 def main() -> None:
@@ -163,19 +147,13 @@ def main() -> None:
     event_ticker = aggregate_event_ticker_scores(articles)
     rf_importances = generate_feature_importances(rng)
 
-    articles.to_csv(out_dir / "articles.csv", index=False)
-    event_ticker.to_csv(out_dir / "event_ticker_scores.csv", index=False)
-    rf_importances.to_csv(out_dir / "rf_feature_importances.csv", index=False)
+    articles.write_csv(out_dir / "articles.csv")
+    event_ticker.write_csv(out_dir / "event_ticker_scores.csv")
+    rf_importances.write_csv(out_dir / "rf_feature_importances.csv")
 
-    print(f"Wrote {len(articles)} article rows to {out_dir / 'articles.csv'}")
-    print(
-        "Wrote "
-        f"{len(event_ticker)} event+ticker rows to {out_dir / 'event_ticker_scores.csv'}"
-    )
-    print(
-        "Wrote "
-        f"{len(rf_importances)} feature rows to {out_dir / 'rf_feature_importances.csv'}"
-    )
+    print(f"Wrote {articles.height} article rows to {out_dir / 'articles.csv'}")
+    print(f"Wrote {event_ticker.height} event+ticker rows to {out_dir / 'event_ticker_scores.csv'}")
+    print(f"Wrote {rf_importances.height} feature rows to {out_dir / 'rf_feature_importances.csv'}")
 
 
 if __name__ == "__main__":

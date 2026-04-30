@@ -19,7 +19,14 @@ export function ModelBlendBreakdown({ prediction }: { prediction: Prediction }) 
         <p className="metric-item"><span>Model weight</span>{(prediction.model_weight_used * 100).toFixed(1)}%</p>
         <p className="metric-item"><span>Sentiment weight</span>{(prediction.sentiment_weight_used * 100).toFixed(1)}%</p>
         <p className="metric-item"><span>RF accuracy</span>{prediction.rf_accuracy === null ? 'n/a' : prediction.rf_accuracy.toFixed(3)}</p>
+        <p className="metric-item"><span>RF F1 (binary)</span>{prediction.rf_f1 === null ? 'n/a' : prediction.rf_f1.toFixed(3)}</p>
         <p className="metric-item"><span>LR R²</span>{prediction.lr_r2 === null ? 'n/a' : prediction.lr_r2.toFixed(3)}</p>
+        <p className="metric-item"><span>LR MAE (% pts)</span>{prediction.lr_mae === null ? 'n/a' : prediction.lr_mae.toFixed(3)}</p>
+        <p className="metric-item"><span>Train class balance</span>
+          {prediction.class_imbalance
+            ? `${prediction.class_imbalance.positive_count.toFixed(0)}↑ / ${prediction.class_imbalance.negative_count.toFixed(0)}↓ (minority frac ${prediction.class_imbalance.minority_class_fraction.toFixed(2)})`
+            : 'n/a'}
+        </p>
         <p className="metric-item"><span>Training samples</span>{prediction.training_samples}</p>
         <p className="metric-item"><span>Clamp bound</span>{toPct(prediction.clamp_bound_pct)}</p>
       </div>

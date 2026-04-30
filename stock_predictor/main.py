@@ -11,7 +11,7 @@ from pipeline_runner import run_pipeline
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stock sentiment + prediction pipeline using MarketAux + FinBERT + sklearn."
+        description="Stock sentiment + prediction pipeline using local RSS-backed news + FinBERT + sklearn."
     )
     parser.add_argument("--query", type=str, help="Natural language query")
     parser.add_argument("--tickers", type=str, help="Comma-separated tickers, e.g. NVDA,TSM,INTC")

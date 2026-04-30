@@ -1,2 +1,2 @@
-generated_at_utc,ticker_count,years_of_prices,rss_lookback_days,raw_news_rows,clean_news_rows,raw_price_rows,feature_price_rows,final_rows_after_cleaning,meets_50k_requirement,final_column_count
-2026-04-30T20:59:13.937809+00:00,90,8,3650,20163,33703,178979,178979,176745,True,24
+generated_at_utc,ticker_count,years_of_prices,rss_lookback_days,company_tickers_json_path,company_tickers_json_symbols,raw_news_rows,clean_news_rows,raw_price_rows,feature_price_rows,final_rows_after_cleaning,meets_50k_requirement,final_column_count
+2026-04-30T22:21:14.961877+00:00,91,5,365,"",0,9865,17801,112952,112952,110700,true,23

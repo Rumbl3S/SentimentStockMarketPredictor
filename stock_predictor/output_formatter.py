@@ -94,9 +94,20 @@ def print_results(
         print(f"   RSI(14):         {price['rsi_14']:.2f}")
 
         if prediction.get("rf_accuracy") is not None:
+            f1v = prediction.get("rf_f1")
+            mae = prediction.get("lr_mae")
+            f1_str = f"{f1v:.2f}" if isinstance(f1v, (int, float)) else "n/a"
+            mae_str = f"{mae:.2f}" if isinstance(mae, (int, float)) else "n/a"
+            imb = prediction.get("class_imbalance") or {}
+            imb_note = ""
+            if isinstance(imb, dict) and imb.get("n_samples"):
+                sev = "severe " if imb.get("imbalance_severe") else ""
+                imb_note = (
+                    f" | Class balance ({sev}minority={imb.get('minority_class_fraction', 0):.2f})"
+                )
             print(
                 f"   RF Accuracy:     {prediction['rf_accuracy']:.2f} | "
-                f"LR R^2: {prediction['lr_r2']:.2f}"
+                f"RF F1: {f1_str} | LR R^2: {prediction['lr_r2']:.2f} | LR MAE: {mae_str}{imb_note}"
             )
 
         print("\nCITED ARTICLES:")

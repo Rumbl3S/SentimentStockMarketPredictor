@@ -1,28 +1,26 @@
-"""Build a large local training dataset from RSS news + Yahoo prices.
-
-This script is designed for class data requirements:
-- web API / web scrape collection
-- local persisted datasets
-- >=50k cleaned rows in final merged dataset
-- 7-10+ feature columns
-"""
+"""Build a large local training dataset from RSS news + Yahoo prices (Polars pipelines)."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import requests
-import yfinance as yf
+from bs4 import BeautifulSoup
+
+from price_fetcher import yfinance_daily_pl
 
 
 DEFAULT_SEED_TICKERS = [
@@ -30,7 +28,7 @@ DEFAULT_SEED_TICKERS = [
     "JNJ", "JPM", "V", "PG", "MA", "HD", "CVX", "ABBV", "PFE", "KO",
     "AVGO", "COST", "PEP", "MRK", "BAC", "WMT", "CSCO", "ADBE", "NFLX", "TMO",
     "ACN", "CRM", "MCD", "DHR", "DIS", "ABT", "VZ", "INTC", "CMCSA", "WFC",
-    "AMD", "TXN", "LIN", "NEE", "BMY", "PM", "UNP", "HON", "QCOM", "LOW",
+    "AMD", "TXN", "TSM", "LIN", "NEE", "BMY", "PM", "UNP", "HON", "QCOM", "LOW",
     "SBUX", "ORCL", "AMGN", "UPS", "GS", "MS", "BLK", "CAT", "BA", "RTX",
     "IBM", "SPGI", "GE", "NOW", "AMAT", "DE", "PLD", "GILD", "MDT", "BKNG",
     "ADP", "LMT", "CVS", "TJX", "MO", "AXP", "C", "SYK", "ISRG", "T",
@@ -44,6 +42,7 @@ TICKER_ALIASES = {
     "AMZN": ["amazon"],
     "META": ["meta", "facebook"],
     "NVDA": ["nvidia"],
+    "TSM": ["taiwan semiconductor", "tsmc", "taiwan semi"],
     "TSLA": ["tesla"],
     "BRK-B": ["berkshire hathaway", "berkshire"],
     "BA": ["boeing"],
@@ -56,6 +55,8 @@ TICKER_ALIASES = {
 POSITIVE_WORDS = {"beat", "surge", "rally", "growth", "gain", "upgrade", "strong", "profit"}
 NEGATIVE_WORDS = {"miss", "drop", "fall", "downgrade", "lawsuit", "crash", "loss", "decline"}
 
+_WIKI_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; stock-predictor-dataset/1.0)"}
+
 
 @dataclass
 class BuildStats:
@@ -64,6 +65,8 @@ class BuildStats:
     raw_price_rows: int = 0
     feature_price_rows: int = 0
     final_rows: int = 0
+    company_tickers_json_path: str = ""
+    company_tickers_loaded: int = 0
 
 
 def _normalize_ticker(ticker: str) -> str:
@@ -90,19 +93,91 @@ def load_tickers_from_file(path: Path) -> list[str]:
     return _dedupe_keep_order(rows)
 
 
+def company_tickers_json_candidates() -> list[Path]:
+    """Search order for SEC company ticker JSON (same schema as company_tickers.json)."""
+    env = os.environ.get("COMPANY_TICKERS_JSON", "").strip()
+    candidates: list[Path] = []
+    if env:
+        candidates.append(Path(env).expanduser().resolve())
+    candidates.append(Path(__file__).resolve().parent / "data" / "reference" / "company_tickers.json")
+    candidates.append(Path("/Users/raghav/company_tickers.json"))
+    candidates.append(Path.home() / "company_tickers.json")
+    return candidates
+
+
+def resolve_company_tickers_json_path(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        p = explicit.expanduser().resolve()
+        return p if p.is_file() else None
+    for p in company_tickers_json_candidates():
+        if p.is_file():
+            return p
+    return None
+
+
+def load_company_tickers_json(path: Path) -> list[str]:
+    """Load tickers from SEC-style company_tickers.json: dict of {index: {ticker, title, cik_str}}."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    symbols: list[str] = []
+    if isinstance(raw, dict):
+        for v in raw.values():
+            if isinstance(v, dict):
+                t = v.get("ticker") or v.get("symbol")
+                if t:
+                    symbols.append(str(t).strip())
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                t = item.get("ticker") or item.get("symbol")
+                if t:
+                    symbols.append(str(t).strip())
+            elif isinstance(item, str):
+                symbols.append(item.strip())
+    return _dedupe_keep_order(symbols)
+
+
+def _parse_wikitable_symbols(html: str, table_id: str | None, ticker_header: str) -> list[str]:
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table", id=table_id) if table_id else None
+    if table is None:
+        for cand in soup.find_all("table", class_=lambda c: c and "wikitable" in str(c).lower()):
+            headers = [th.get_text(strip=True) for th in cand.find_all("th")]
+            if ticker_header in headers:
+                table = cand
+                break
+    if table is None:
+        return []
+    headers = [th.get_text(strip=True) for th in table.find_all("th")]
+    try:
+        idx = headers.index(ticker_header)
+    except ValueError:
+        idx = 0
+    symbols: list[str] = []
+    for tr in table.find_all("tr")[1:]:
+        tds = tr.find_all("td")
+        if len(tds) > idx:
+            sym = tds[idx].get_text(strip=True).replace(".", "-")
+            if sym and re.match(r"^[A-Z0-9.-]{1,15}$", sym, re.I):
+                symbols.append(sym.upper())
+    return _dedupe_keep_order(symbols)
+
+
 def fetch_sp500_tickers() -> list[str]:
     try:
-        table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
-        return _dedupe_keep_order(table["Symbol"].astype(str).tolist())
+        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        r = requests.get(url, headers=_WIKI_HEADERS, timeout=45)
+        r.raise_for_status()
+        return _parse_wikitable_symbols(r.text, "constituents", "Symbol")
     except Exception:
         return []
 
 
 def fetch_nasdaq100_tickers() -> list[str]:
     try:
-        table = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")[4]
-        column = "Ticker" if "Ticker" in table.columns else table.columns[1]
-        return _dedupe_keep_order(table[column].astype(str).tolist())
+        url = "https://en.wikipedia.org/wiki/Nasdaq-100"
+        r = requests.get(url, headers=_WIKI_HEADERS, timeout=45)
+        r.raise_for_status()
+        return _parse_wikitable_symbols(r.text, None, "Ticker")
     except Exception:
         return []
 
@@ -112,24 +187,51 @@ def resolve_ticker_universe(
     manual_tickers: list[str],
     tickers_file: Path | None,
     min_count: int = 50,
-) -> list[str]:
+    company_json_path: Path | None = None,
+) -> tuple[list[str], str, int]:
+    """Return (tickers, company_json_path_used, company_json_count)."""
     source_tickers: list[str] = []
-    if ticker_source == "sp500":
+    company_path_used = ""
+    company_loaded = 0
+
+    json_path = resolve_company_tickers_json_path(company_json_path)
+    company_list = load_company_tickers_json(json_path) if json_path else []
+
+    if ticker_source == "company_json":
+        if not company_list:
+            print(
+                "Warning: company_tickers.json not found or empty; "
+                f"tried {', '.join(str(p) for p in company_tickers_json_candidates()[:4])}… "
+                "falling back to DEFAULT_SEED_TICKERS."
+            )
+            source_tickers = list(DEFAULT_SEED_TICKERS)
+        else:
+            source_tickers = company_list
+            company_path_used = str(json_path) if json_path else ""
+            company_loaded = len(company_list)
+    elif ticker_source == "sp500":
         source_tickers = fetch_sp500_tickers()
     elif ticker_source == "nasdaq100":
         source_tickers = fetch_nasdaq100_tickers()
     elif ticker_source == "all":
-        source_tickers = fetch_sp500_tickers() + fetch_nasdaq100_tickers() + DEFAULT_SEED_TICKERS
+        source_tickers = (
+            company_list
+            + fetch_sp500_tickers()
+            + fetch_nasdaq100_tickers()
+            + list(DEFAULT_SEED_TICKERS)
+        )
+        if json_path:
+            company_path_used = str(json_path)
+            company_loaded = len(company_list)
     else:
-        source_tickers = DEFAULT_SEED_TICKERS
+        source_tickers = list(DEFAULT_SEED_TICKERS)
 
     file_tickers = load_tickers_from_file(tickers_file) if tickers_file else []
     combined = _dedupe_keep_order(source_tickers + file_tickers + manual_tickers)
 
-    # Safety fallback: never run tiny universes unless explicitly requested.
     if len(combined) < min_count:
-        combined = _dedupe_keep_order(combined + DEFAULT_SEED_TICKERS)
-    return combined
+        combined = _dedupe_keep_order(combined + list(DEFAULT_SEED_TICKERS))
+    return combined, company_path_used, company_loaded
 
 
 def ensure_dirs(root: Path) -> dict[str, Path]:
@@ -153,7 +255,12 @@ def parse_pub_date(raw: str) -> datetime | None:
     return None
 
 
-def rss_for_ticker(ticker: str, lookback_days: int, timeout: int = 20) -> list[dict]:
+def rss_for_ticker(
+    ticker: str,
+    lookback_days: int,
+    timeout: int = 20,
+    max_query_templates: int | None = None,
+) -> list[dict]:
     aliases = TICKER_ALIASES.get(ticker, [])
     primary_name = aliases[0] if aliases else ticker
     query_templates = [
@@ -163,6 +270,8 @@ def rss_for_ticker(ticker: str, lookback_days: int, timeout: int = 20) -> list[d
         f"{primary_name} lawsuit investigation risk when:{lookback_days}d",
         f"{primary_name} analyst target outlook when:{lookback_days}d",
     ]
+    if max_query_templates is not None:
+        query_templates = query_templates[: max(1, min(5, int(max_query_templates)))]
     rows: list[dict] = []
     for q in query_templates:
         query = quote_plus(q)
@@ -195,26 +304,39 @@ def rss_for_ticker(ticker: str, lookback_days: int, timeout: int = 20) -> list[d
     return rows
 
 
-def collect_rss_news(tickers: Iterable[str], lookback_days: int) -> pd.DataFrame:
+def collect_rss_news(
+    tickers: Iterable[str],
+    lookback_days: int,
+    max_query_templates: int | None = None,
+) -> pl.DataFrame:
     rows: list[dict] = []
     for ticker in tickers:
-        rows.extend(rss_for_ticker(ticker, lookback_days=lookback_days))
-    if not rows:
-        return pd.DataFrame(
-            columns=[
-                "ticker_seed",
-                "query_template",
-                "title",
-                "url",
-                "source",
-                "published_at",
-                "description",
-            ]
+        rows.extend(
+            rss_for_ticker(ticker, lookback_days=lookback_days, max_query_templates=max_query_templates)
         )
-    news = pd.DataFrame(rows)
-    news = news.drop_duplicates(subset=["url", "title"]).copy()
-    news["date"] = pd.to_datetime(news["published_at"], errors="coerce").dt.date
-    return news
+    if not rows:
+        return pl.DataFrame(
+            schema={
+                "ticker_seed": pl.Utf8,
+                "query_template": pl.Utf8,
+                "title": pl.Utf8,
+                "url": pl.Utf8,
+                "source": pl.Utf8,
+                "published_at": pl.Utf8,
+                "description": pl.Utf8,
+            }
+        )
+    df = pl.DataFrame(rows)
+    df = df.unique(subset=["url", "title"], keep="first")
+    pub = pl.col("published_at")
+    date_from_iso = pub.str.to_datetime(time_zone="UTC", strict=False).dt.date()
+    date_from_prefix = pub.str.slice(0, 10).str.to_date("%Y-%m-%d", strict=False)
+    return df.with_columns(
+        pl.when(pub.str.len_chars() > 8)
+        .then(pl.coalesce(date_from_iso, date_from_prefix))
+        .otherwise(None)
+        .alias("date")
+    ).drop_nulls("date")
 
 
 def find_ticker_matches(text: str, tickers: Iterable[str]) -> list[str]:
@@ -253,18 +375,37 @@ def simple_sentiment(text: str) -> float:
     return float(np.clip(score, -1.0, 1.0))
 
 
-def build_news_features(news_df: pd.DataFrame, tickers: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if news_df.empty:
-        empty_articles = pd.DataFrame(
-            columns=["ticker", "date", "title", "url", "source", "highlight", "sentiment_score", "relevance_score"]
+def build_news_features(news_df: pl.DataFrame, tickers: list[str]) -> tuple[pl.DataFrame, pl.DataFrame]:
+    if news_df.is_empty():
+        empty_a = pl.DataFrame(
+            schema={
+                "ticker": pl.Utf8,
+                "date": pl.Date,
+                "title": pl.Utf8,
+                "url": pl.Utf8,
+                "source": pl.Utf8,
+                "description": pl.Utf8,
+                "highlight": pl.Utf8,
+                "sentiment_score": pl.Float64,
+                "relevance_score": pl.Float64,
+            }
         )
-        empty_daily = pd.DataFrame(
-            columns=["ticker", "date", "article_count", "avg_sentiment", "sentiment_std", "positive_ratio", "negative_ratio", "avg_relevance"]
+        empty_d = pl.DataFrame(
+            schema={
+                "ticker": pl.Utf8,
+                "date": pl.Date,
+                "article_count": pl.Int64,
+                "avg_sentiment": pl.Float64,
+                "sentiment_std": pl.Float64,
+                "positive_ratio": pl.Float64,
+                "negative_ratio": pl.Float64,
+                "avg_relevance": pl.Float64,
+            }
         )
-        return empty_articles, empty_daily
+        return empty_a, empty_d
 
     mapped_rows: list[dict] = []
-    for _, row in news_df.iterrows():
+    for row in news_df.iter_rows(named=True):
         text_blob = f"{row.get('title', '')}. {row.get('description', '')}"
         matched = find_ticker_matches(text_blob, tickers)
         if not matched:
@@ -288,108 +429,154 @@ def build_news_features(news_df: pd.DataFrame, tickers: list[str]) -> tuple[pd.D
                 }
             )
 
-    articles = pd.DataFrame(mapped_rows).dropna(subset=["date"]).copy()
-    if articles.empty:
-        return articles, pd.DataFrame()
+    articles = pl.DataFrame(mapped_rows).drop_nulls("date")
+    if articles.is_empty():
+        return articles, pl.DataFrame()
 
-    articles["date"] = pd.to_datetime(articles["date"]).dt.date
-    articles["is_positive"] = (articles["sentiment_score"] > 0.1).astype(int)
-    articles["is_negative"] = (articles["sentiment_score"] < -0.1).astype(int)
+    articles = articles.with_columns(
+        (pl.col("sentiment_score") > 0.1).cast(pl.Int8).alias("is_positive"),
+        (pl.col("sentiment_score") < -0.1).cast(pl.Int8).alias("is_negative"),
+    )
 
     grouped = (
-        articles.groupby(["ticker", "date"], as_index=False)
+        articles.group_by(["ticker", "date"])
         .agg(
-            article_count=("title", "count"),
-            avg_sentiment=("sentiment_score", "mean"),
-            sentiment_std=("sentiment_score", "std"),
-            positive_ratio=("is_positive", "mean"),
-            negative_ratio=("is_negative", "mean"),
-            avg_relevance=("relevance_score", "mean"),
+            pl.len().alias("article_count"),
+            pl.col("sentiment_score").mean().alias("avg_sentiment"),
+            pl.col("sentiment_score").std().fill_null(0.0).alias("sentiment_std"),
+            pl.col("is_positive").mean().alias("positive_ratio"),
+            pl.col("is_negative").mean().alias("negative_ratio"),
+            pl.col("relevance_score").mean().alias("avg_relevance"),
         )
-        .fillna(0.0)
+        .sort(["ticker", "date"])
     )
     return articles, grouped
 
 
-def fetch_prices(tickers: list[str], years: int) -> pd.DataFrame:
+def _fetch_one_ticker_history(ticker: str, period: str) -> pl.DataFrame | None:
+    try:
+        hist = yfinance_daily_pl(ticker, period)
+    except ValueError:
+        return None
+    if hist.is_empty():
+        return None
+    return hist.with_columns(pl.lit(ticker).alias("ticker"))
+
+
+def fetch_prices(tickers: list[str], years: int, price_workers: int = 6) -> pl.DataFrame:
+    """Download daily OHLCV; uses a small thread pool to overlap Yahoo requests."""
     period = f"{years}y"
-    data = yf.download(
-        tickers=tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True,
-        progress=False,
-    )
-    rows: list[dict] = []
-    for ticker in tickers:
-        try:
-            ticker_df = data[ticker].dropna(subset=["Close"]).copy()
-        except Exception:
-            continue
-        if ticker_df.empty:
-            continue
-        ticker_df = ticker_df.reset_index()
-        for _, r in ticker_df.iterrows():
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "date": pd.to_datetime(r["Date"]).date(),
-                    "open": float(r["Open"]),
-                    "high": float(r["High"]),
-                    "low": float(r["Low"]),
-                    "close": float(r["Close"]),
-                    "adj_close": float(r.get("Adj Close", r["Close"])),
-                    "volume": float(r["Volume"]),
-                }
-            )
-    return pd.DataFrame(rows)
+    frames: list[pl.DataFrame] = []
+    tickers_u = [t for t in tickers if t]
+    if not tickers_u:
+        return pl.DataFrame(
+            schema={
+                "ticker": pl.Utf8,
+                "date": pl.Date,
+                "open": pl.Float64,
+                "high": pl.Float64,
+                "low": pl.Float64,
+                "close": pl.Float64,
+                "volume": pl.Float64,
+            }
+        )
+
+    workers = max(1, min(int(price_workers), len(tickers_u), 12))
+    if workers == 1:
+        for ticker in tickers_u:
+            h = _fetch_one_ticker_history(ticker, period)
+            if h is not None:
+                frames.append(h)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_one_ticker_history, t, period): t for t in tickers_u}
+            for fut in as_completed(futures):
+                h = fut.result()
+                if h is not None:
+                    frames.append(h)
+
+    if not frames:
+        return pl.DataFrame(
+            schema={
+                "ticker": pl.Utf8,
+                "date": pl.Date,
+                "open": pl.Float64,
+                "high": pl.Float64,
+                "low": pl.Float64,
+                "close": pl.Float64,
+                "volume": pl.Float64,
+            }
+        )
+    return pl.concat(frames, how="vertical")
 
 
-def add_price_features(prices: pd.DataFrame) -> pd.DataFrame:
-    if prices.empty:
+def add_price_features(prices: pl.DataFrame) -> pl.DataFrame:
+    if prices.is_empty():
         return prices
-    prices = prices.sort_values(["ticker", "date"]).copy()
+    g = "ticker"
+    c = pl.col("close")
+    v = pl.col("volume")
+    dr = c.pct_change()
+    gain = c.diff().clip(lower_bound=0.0).rolling_mean(14, min_samples=1).over(g)
+    loss = (-c.diff().clip(upper_bound=0.0)).rolling_mean(14, min_samples=1).over(g)
+    rs = gain / pl.max_horizontal(loss, pl.lit(1e-12))
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    fut = ((c.shift(-5).over(g) / c) - 1.0) * 100.0
 
-    def per_ticker(df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        ticker_value = str(df["ticker"].iloc[0]) if "ticker" in df.columns and not df.empty else ""
-        df["daily_return"] = df["close"].pct_change()
-        df["returns_5d"] = (df["close"] / df["close"].shift(5) - 1.0) * 100
-        df["returns_10d"] = (df["close"] / df["close"].shift(10) - 1.0) * 100
-        df["returns_20d"] = (df["close"] / df["close"].shift(20) - 1.0) * 100
-        df["volatility_20d"] = df["daily_return"].rolling(20).std()
-        df["volume_ratio"] = df["volume"].rolling(5).mean() / df["volume"].rolling(20).mean()
+    out = (
+        prices.sort([g, "date"])
+        .with_columns(
+            dr.over(g).alias("daily_return"),
+            (((c / c.shift(5).over(g)) - 1.0) * 100.0).alias("returns_5d"),
+            (((c / c.shift(10).over(g)) - 1.0) * 100.0).alias("returns_10d"),
+            (((c / c.shift(20).over(g)) - 1.0) * 100.0).alias("returns_20d"),
+            dr.rolling_std(20, min_samples=2).over(g).alias("volatility_20d"),
+            (v.rolling_mean(5, min_samples=1).over(g) / pl.max_horizontal(v.rolling_mean(20, min_samples=1).over(g), pl.lit(1e-9))).alias("volume_ratio"),
+            rsi.fill_nan(50.0).alias("rsi_14"),
+            (c.rolling_mean(5, min_samples=1).over(g) > c.rolling_mean(20, min_samples=1).over(g))
+            .cast(pl.Int8)
+            .alias("sma_cross"),
+            fut.alias("future_5d_return"),
+        )
+        .with_columns((pl.col("future_5d_return") > 0).cast(pl.Int8).alias("future_5d_direction"))
+    )
+    finite_cols = [
+        "daily_return",
+        "returns_5d",
+        "returns_10d",
+        "returns_20d",
+        "volatility_20d",
+        "volume_ratio",
+        "rsi_14",
+        "future_5d_return",
+    ]
+    for name in finite_cols:
+        out = out.with_columns(
+            pl.when(pl.col(name).is_finite()).then(pl.col(name)).otherwise(None).alias(name)
+        )
+    return out
 
-        delta = df["close"].diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan)
-        rs = gain / loss
-        df["rsi_14"] = 100 - (100 / (1 + rs))
-        df["sma_cross"] = (df["close"].rolling(5).mean() > df["close"].rolling(20).mean()).astype(int)
 
-        df["future_5d_return"] = (df["close"].shift(-5) / df["close"] - 1.0) * 100
-        df["future_5d_direction"] = (df["future_5d_return"] > 0).astype(int)
-        df["ticker"] = ticker_value
-        return df
-
-    features = prices.groupby("ticker", group_keys=False).apply(per_ticker).reset_index(drop=True)
-    features = features.replace([np.inf, -np.inf], np.nan)
-    return features
-
-
-def build_final_dataset(price_features: pd.DataFrame, news_daily: pd.DataFrame) -> pd.DataFrame:
-    if price_features.empty:
-        return pd.DataFrame()
+def build_final_dataset(price_features: pl.DataFrame, news_daily: pl.DataFrame) -> pl.DataFrame:
+    if price_features.is_empty():
+        return price_features
     if "ticker" not in price_features.columns or "date" not in price_features.columns:
-        return pd.DataFrame()
-    if news_daily.empty or "ticker" not in news_daily.columns or "date" not in news_daily.columns:
-        news_daily = pd.DataFrame(columns=["ticker", "date"])
-    merged = price_features.merge(news_daily, how="left", on=["ticker", "date"])
-    for col in ["article_count", "avg_sentiment", "sentiment_std", "positive_ratio", "negative_ratio", "avg_relevance"]:
-        if col in merged:
-            merged[col] = merged[col].fillna(0.0)
+        return pl.DataFrame()
+    if news_daily.is_empty():
+        news_daily = pl.DataFrame(schema={"ticker": pl.Utf8, "date": pl.Date})
+
+    merged = price_features.join(news_daily, on=["ticker", "date"], how="left")
+    fill_cols = [
+        "article_count",
+        "avg_sentiment",
+        "sentiment_std",
+        "positive_ratio",
+        "negative_ratio",
+        "avg_relevance",
+    ]
+    for col in fill_cols:
+        if col in merged.columns:
+            merged = merged.with_columns(pl.col(col).fill_null(0.0))
 
     required = [
         "returns_5d",
@@ -402,97 +589,143 @@ def build_final_dataset(price_features: pd.DataFrame, news_daily: pd.DataFrame) 
         "future_5d_return",
         "future_5d_direction",
     ]
-    cleaned = merged.dropna(subset=required).copy()
-    return cleaned
+    return merged.drop_nulls(subset=required)
 
 
-def run(output_root: Path, years: int, rss_lookback_days: int, tickers: list[str]) -> BuildStats:
+def run(
+    output_root: Path,
+    years: int,
+    rss_lookback_days: int,
+    tickers: list[str],
+    company_json_meta: tuple[str, int] = ("", 0),
+    rss_query_templates: int | None = None,
+    price_workers: int = 6,
+) -> BuildStats:
     stats = BuildStats()
+    stats.company_tickers_json_path, stats.company_tickers_loaded = company_json_meta
     dirs = ensure_dirs(output_root)
 
-    # 1) Collect RSS/news raw
-    news_raw = collect_rss_news(tickers, lookback_days=rss_lookback_days)
-    stats.raw_news_rows = int(len(news_raw))
-    news_raw.to_csv(dirs["raw"] / "rss_articles_raw.csv", index=False)
+    news_raw = collect_rss_news(
+        tickers, lookback_days=rss_lookback_days, max_query_templates=rss_query_templates
+    )
+    stats.raw_news_rows = int(news_raw.height)
+    news_raw.write_csv(dirs["raw"] / "rss_articles_raw.csv")
 
-    # 2) Build mapped/feature news tables
     articles_mapped, news_daily = build_news_features(news_raw, tickers)
-    stats.clean_news_rows = int(len(articles_mapped))
-    articles_mapped.to_csv(dirs["processed"] / "news_articles_mapped.csv", index=False)
-    news_daily.to_csv(dirs["processed"] / "news_daily_features.csv", index=False)
+    stats.clean_news_rows = int(articles_mapped.height)
+    articles_mapped.write_csv(dirs["processed"] / "news_articles_mapped.csv")
+    news_daily.write_csv(dirs["processed"] / "news_daily_features.csv")
 
-    # 3) Collect prices
-    prices_raw = fetch_prices(tickers, years=years)
-    stats.raw_price_rows = int(len(prices_raw))
-    prices_raw.to_csv(dirs["raw"] / "yahoo_prices_raw.csv", index=False)
+    prices_raw = fetch_prices(tickers, years=years, price_workers=price_workers)
+    stats.raw_price_rows = int(prices_raw.height)
+    prices_raw.write_csv(dirs["raw"] / "yahoo_prices_raw.csv")
 
-    # 4) Engineer price features
     price_features = add_price_features(prices_raw)
-    stats.feature_price_rows = int(len(price_features))
-    price_features.to_csv(dirs["processed"] / "price_features.csv", index=False)
+    stats.feature_price_rows = int(price_features.height)
+    price_features.write_csv(dirs["processed"] / "price_features.csv")
 
-    # 5) Merge final dataset
     final_df = build_final_dataset(price_features, news_daily)
-    stats.final_rows = int(len(final_df))
-    final_df.to_csv(dirs["final"] / "final_model_dataset.csv", index=False)
+    stats.final_rows = int(final_df.height)
+    final_df.write_csv(dirs["final"] / "final_model_dataset.csv")
 
-    # 6) Metadata summary
     summary = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "ticker_count": len(tickers),
         "years_of_prices": years,
         "rss_lookback_days": rss_lookback_days,
+        "company_tickers_json_path": stats.company_tickers_json_path,
+        "company_tickers_json_symbols": stats.company_tickers_loaded,
         "raw_news_rows": stats.raw_news_rows,
         "clean_news_rows": stats.clean_news_rows,
         "raw_price_rows": stats.raw_price_rows,
         "feature_price_rows": stats.feature_price_rows,
         "final_rows_after_cleaning": stats.final_rows,
         "meets_50k_requirement": stats.final_rows >= 50000,
-        "final_column_count": int(final_df.shape[1]) if not final_df.empty else 0,
+        "final_column_count": int(final_df.width) if not final_df.is_empty() else 0,
     }
-    pd.DataFrame([summary]).to_csv(dirs["final"] / "dataset_summary.csv", index=False)
+    pl.DataFrame([summary]).write_csv(dirs["final"] / "dataset_summary.csv")
     return stats
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build local stock/news dataset from RSS + Yahoo data.")
-    parser.add_argument("--years", type=int, default=8, help="Years of Yahoo price history to pull.")
-    parser.add_argument("--rss-lookback-days", type=int, default=3650, help="Google News RSS lookback days in query.")
+    parser.add_argument(
+        "--years",
+        type=int,
+        default=5,
+        help="Years of Yahoo price history (default 5 for faster builds; use 8+ for more history).",
+    )
+    parser.add_argument(
+        "--rss-lookback-days",
+        type=int,
+        default=365,
+        help="Google News 'when:Xd' window per query (default 365; use 3650 for ~10y recall, much slower).",
+    )
+    parser.add_argument(
+        "--rss-query-templates",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Use first N RSS query templates per ticker (1-5). Default 2 is fast; 5 matches older full recall.",
+    )
+    parser.add_argument(
+        "--price-workers",
+        type=int,
+        default=6,
+        help="Parallel Yahoo downloads (1-12). Higher can speed builds but may hit rate limits.",
+    )
     parser.add_argument(
         "--ticker-source",
-        choices=["seed", "sp500", "nasdaq100", "all"],
-        default="sp500",
-        help="How to build the ticker universe for local dataset generation.",
+        choices=["company_json", "seed", "sp500", "nasdaq100", "all"],
+        default="seed",
+        help=(
+            "Ticker universe for this build only (not the CLI query tickers). "
+            "seed = ~90 built-in names (default, fastest). "
+            "sp500 ~500 names. company_json ~10k (slow; use --max-tickers). "
+            "all = company_json + indices + seed."
+        ),
     )
     parser.add_argument(
-        "--tickers",
+        "--company-tickers-json",
         type=str,
         default="",
-        help="Optional extra tickers to include, comma-separated.",
+        help="Path to company_tickers.json (overrides env COMPANY_TICKERS_JSON and built-in search paths).",
     )
+    parser.add_argument("--tickers", type=str, default="", help="Optional extra tickers, comma-separated.")
+    parser.add_argument("--tickers-file", type=str, default="", help="Optional newline-delimited ticker file.")
     parser.add_argument(
-        "--tickers-file",
-        type=str,
-        default="",
-        help="Optional path to a newline-delimited ticker file.",
+        "--max-tickers",
+        type=int,
+        default=0,
+        help="If >0, cap universe to the first N symbols after merge (for smoke tests). 0 = no cap.",
     )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parent
     manual_tickers = _dedupe_keep_order(args.tickers.split(",")) if args.tickers else []
     tickers_file = Path(args.tickers_file).expanduser().resolve() if args.tickers_file else None
-    tickers = resolve_ticker_universe(
+    company_arg = Path(args.company_tickers_json).expanduser().resolve() if args.company_tickers_json else None
+    tickers, company_path_used, company_loaded = resolve_ticker_universe(
         ticker_source=args.ticker_source,
         manual_tickers=manual_tickers,
         tickers_file=tickers_file,
+        company_json_path=company_arg,
     )
+    if args.max_tickers and args.max_tickers > 0:
+        tickers = tickers[: args.max_tickers]
+    rss_q = max(1, min(5, int(args.rss_query_templates)))
     stats = run(
         output_root=root,
         years=args.years,
         rss_lookback_days=args.rss_lookback_days,
         tickers=tickers,
+        company_json_meta=(company_path_used, company_loaded),
+        rss_query_templates=rss_q,
+        price_workers=max(1, min(12, int(args.price_workers))),
     )
     print(f"Ticker source: {args.ticker_source}")
+    if company_path_used:
+        print(f"Company tickers JSON: {company_path_used} ({company_loaded} symbols before merge)")
     print(f"Tickers used: {len(tickers)}")
     print(f"Raw news rows: {stats.raw_news_rows}")
     print(f"Mapped/clean news rows: {stats.clean_news_rows}")
