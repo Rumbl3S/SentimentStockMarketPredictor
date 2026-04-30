@@ -1,4 +1,9 @@
-"""Build five analysis plots from generated datasets (Polars read + matplotlib)."""
+"""Build analysis plots from generated datasets (Polars read + matplotlib).
+
+Plots 1–5 are the original course-style figures. Plot 6 compares direction models
+(RandomForest vs dummy vs logistic) when ``model_metrics.csv`` is present.
+Plot 7 is a KMeans elbow curve on article embedding columns (same inputs as PCA clustering).
+"""
 
 from __future__ import annotations
 
@@ -9,10 +14,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import polars as pl
 import seaborn as sns
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+
+
+def _embedding_matrix(df_articles: pl.DataFrame) -> tuple[np.ndarray, list[str]]:
+    embed_cols = [c for c in df_articles.columns if c.startswith("embedding_")]
+    if not embed_cols:
+        return np.array([]), []
+    x = df_articles.select(embed_cols).to_numpy()
+    return x, embed_cols
 
 
 def _set_style() -> None:
@@ -137,12 +151,69 @@ def plot_semantic_vs_sentiment(df_event_ticker: pl.DataFrame, out_dir: Path) -> 
     plt.close()
 
 
+def plot_model_comparison(df_metrics: pl.DataFrame, out_dir: Path) -> bool:
+    """Bar chart: mean accuracy / F1 / ROC-AUC by model (teammate CSV schema)."""
+    metric_cols = [c for c in ("accuracy", "f1", "roc_auc") if c in df_metrics.columns]
+    if not metric_cols or "model" not in df_metrics.columns:
+        return False
+    summary = (
+        df_metrics.group_by("model")
+        .agg([pl.mean(c).alias(c) for c in metric_cols])
+        .sort("model")
+    )
+    long_df = summary.unpivot(
+        index=["model"],
+        on=metric_cols,
+        variable_name="metric",
+        value_name="score",
+    ).filter(pl.col("score").is_finite())
+    if long_df.is_empty():
+        return False
+
+    plt.figure(figsize=(11, 7))
+    sns.barplot(data=pd.DataFrame(long_df.to_dicts()), x="metric", y="score", hue="model")
+    plt.ylim(0.0, 1.0)
+    plt.title("Model evaluation comparison (mean across event/ticker splits)")
+    plt.xlabel("Metric")
+    plt.ylabel("Score")
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    plt.savefig(out_dir / "6_model_comparison_metrics.png", dpi=180)
+    plt.close()
+    return True
+
+
+def plot_elbow_method(df_articles: pl.DataFrame, out_dir: Path, max_k: int = 10) -> bool:
+    """Elbow curve for KMeans inertia on article embedding matrix."""
+    x, _ = _embedding_matrix(df_articles)
+    if x.size == 0 or len(x) < 15:
+        return False
+    k_hi = min(max(2, int(max_k)), len(x) - 1, 15)
+    ks: list[int] = []
+    inertias: list[float] = []
+    for k in range(1, k_hi + 1):
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        km.fit(x)
+        ks.append(k)
+        inertias.append(float(km.inertia_))
+    plt.figure(figsize=(9, 5.5))
+    plt.plot(ks, inertias, marker="o", color="#4c78a8")
+    plt.xlabel("k (clusters)")
+    plt.ylabel("Inertia (within-cluster sum of squares)")
+    plt.title("KMeans elbow on article embeddings")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_dir / "7_elbow_method.png", dpi=180)
+    plt.close()
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate analysis graphs.")
     parser.add_argument("--data-dir", default="analysis/data", help="Directory with CSV inputs.")
     parser.add_argument("--output-dir", default="analysis/plots", help="Directory for plot images.")
     parser.add_argument("--similarity-floor", type=float, default=0.35)
-    parser.add_argument("--n-clusters", type=int, default=5)
+    parser.add_argument("--n-clusters", type=int, default=4, help="KMeans clusters for embedding PCA plot.")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -152,6 +223,10 @@ def main() -> None:
     df_articles = pl.read_csv(data_dir / "articles.csv")
     df_event_ticker = pl.read_csv(data_dir / "event_ticker_scores.csv")
     df_importances = pl.read_csv(data_dir / "rf_feature_importances.csv")
+    model_metrics_path = data_dir / "model_metrics.csv"
+    df_model_metrics = (
+        pl.read_csv(model_metrics_path) if model_metrics_path.exists() else pl.DataFrame()
+    )
 
     _set_style()
     plot_finbert_distribution(df_articles, out_dir)
@@ -159,7 +234,13 @@ def main() -> None:
     plot_embedding_clusters(df_articles, out_dir, args.n_clusters)
     plot_rf_importances(df_importances, out_dir)
     plot_semantic_vs_sentiment(df_event_ticker, out_dir)
-    print(f"Saved 5 plots in {out_dir}")
+    n_plots = 5
+    if plot_elbow_method(df_articles, out_dir, max_k=10):
+        n_plots += 1
+    if not df_model_metrics.is_empty() and "model" in df_model_metrics.columns:
+        if plot_model_comparison(df_model_metrics, out_dir):
+            n_plots += 1
+    print(f"Saved {n_plots} plot file(s) under {out_dir} (plots 1–5; plus 6–7 when data allows).")
 
 
 if __name__ == "__main__":

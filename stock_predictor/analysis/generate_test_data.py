@@ -37,6 +37,8 @@ FEATURES = [
     "relative_strength_5d",
 ]
 
+N_ARTICLE_CLUSTERS = 4
+
 EVENT_SENTIMENT_DRIFT = {
     "AI chip demand surge": 0.24,
     "Fed rates hold": 0.02,
@@ -66,7 +68,7 @@ def sentiment_label(score: float) -> str:
 
 
 def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pl.DataFrame:
-    cluster_centers = rng.normal(0, 1.0, size=(5, embedding_dim))
+    cluster_centers = rng.normal(0, 1.0, size=(N_ARTICLE_CLUSTERS, embedding_dim))
     rows: list[dict] = []
     article_id = 1
     for event in EVENTS:
@@ -83,7 +85,7 @@ def generate_articles(rng: np.random.Generator, embedding_dim: int = 24) -> pl.D
 
                 score = float(np.clip(rng.normal(event_bias + ticker_bias, 0.35), -1.0, 1.0))
                 label = sentiment_label(score)
-                cluster_id = int(rng.integers(0, 5))
+                cluster_id = int(rng.integers(0, N_ARTICLE_CLUSTERS))
 
                 semantic_centered = (2.0 * similarity) - 1.0
                 semantic_score = float(
@@ -124,6 +126,46 @@ def aggregate_event_ticker_scores(df_articles: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def generate_model_metrics(rng: np.random.Generator) -> pl.DataFrame:
+    """Synthetic per-event/ticker rows for RF vs dummy vs logistic (same schema as ``generate_real_data``)."""
+    rows: list[dict] = []
+    for event in EVENTS:
+        for ticker in TICKERS:
+            noise = float(rng.normal(0, 0.02))
+            rows.extend(
+                [
+                    {
+                        "event": event,
+                        "ticker": ticker,
+                        "model": "RandomForest (current)",
+                        "accuracy": float(np.clip(0.56 + noise + rng.normal(0, 0.03), 0.4, 0.92)),
+                        "f1": float(np.clip(0.64 + noise + rng.normal(0, 0.04), 0.35, 0.9)),
+                        "roc_auc": float(np.clip(0.58 + noise + rng.normal(0, 0.05), 0.45, 0.85)),
+                        "test_samples": int(rng.integers(180, 260)),
+                    },
+                    {
+                        "event": event,
+                        "ticker": ticker,
+                        "model": "Dummy Uniform (baseline)",
+                        "accuracy": float(np.clip(0.50 + rng.normal(0, 0.02), 0.42, 0.58)),
+                        "f1": float(np.clip(0.52 + rng.normal(0, 0.03), 0.42, 0.62)),
+                        "roc_auc": 0.5,
+                        "test_samples": int(rng.integers(180, 260)),
+                    },
+                    {
+                        "event": event,
+                        "ticker": ticker,
+                        "model": "LogisticRegression",
+                        "accuracy": float(np.clip(0.54 + noise + rng.normal(0, 0.03), 0.42, 0.88)),
+                        "f1": float(np.clip(0.62 + noise + rng.normal(0, 0.04), 0.4, 0.88)),
+                        "roc_auc": float(np.clip(0.55 + noise + rng.normal(0, 0.05), 0.42, 0.82)),
+                        "test_samples": int(rng.integers(180, 260)),
+                    },
+                ]
+            )
+    return pl.DataFrame(rows)
+
+
 def generate_feature_importances(rng: np.random.Generator) -> pl.DataFrame:
     base = np.array([0.07, 0.11, 0.09, 0.22, 0.08, 0.10, 0.08, 0.09, 0.16], dtype=float)
     noise = rng.normal(0.0, 0.015, size=len(base))
@@ -146,14 +188,17 @@ def main() -> None:
     articles = generate_articles(rng=rng, embedding_dim=args.embedding_dim)
     event_ticker = aggregate_event_ticker_scores(articles)
     rf_importances = generate_feature_importances(rng)
+    model_metrics = generate_model_metrics(rng)
 
     articles.write_csv(out_dir / "articles.csv")
     event_ticker.write_csv(out_dir / "event_ticker_scores.csv")
     rf_importances.write_csv(out_dir / "rf_feature_importances.csv")
+    model_metrics.write_csv(out_dir / "model_metrics.csv")
 
     print(f"Wrote {articles.height} article rows to {out_dir / 'articles.csv'}")
     print(f"Wrote {event_ticker.height} event+ticker rows to {out_dir / 'event_ticker_scores.csv'}")
     print(f"Wrote {rf_importances.height} feature rows to {out_dir / 'rf_feature_importances.csv'}")
+    print(f"Wrote {model_metrics.height} model metric rows to {out_dir / 'model_metrics.csv'}")
 
 
 if __name__ == "__main__":

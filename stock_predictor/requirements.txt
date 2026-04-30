@@ -4,6 +4,7 @@ transformers
 torch
 scikit-learn
 numpy
+pandas
 polars
 beautifulsoup4
 lxml

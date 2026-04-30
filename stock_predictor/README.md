@@ -77,13 +77,13 @@ Example request body:
 
 ## Analysis graph scripts
 
-Generate synthetic test data:
+Generate synthetic test data (includes `model_metrics.csv` for model comparison):
 
 `python analysis/generate_test_data.py --output-dir analysis/data --seed 42`
 
-Create all five analysis graphs:
+Create analysis graphs (plots 1–5 always; **6** and **7** when inputs allow):
 
-`python analysis/plot_graphs.py --data-dir analysis/data --output-dir analysis/plots --similarity-floor 0.35`
+`python analysis/plot_graphs.py --data-dir analysis/data --output-dir analysis/plots --similarity-floor 0.35` (embedding KMeans defaults to **4** clusters; override with `--n-clusters`.)
 
 Outputs:
 - `analysis/plots/1_finbert_sentiment_distribution.png`
@@ -91,6 +91,16 @@ Outputs:
 - `analysis/plots/3_embedding_clusters_pca.png`
 - `analysis/plots/4_rf_feature_importances.png`
 - `analysis/plots/5_semantic_vs_sentiment_scatter.png`
+- `analysis/plots/6_model_comparison_metrics.png` — mean accuracy / F1 / ROC-AUC for **RandomForest (current)**, **Dummy uniform baseline**, and **LogisticRegression**, when `analysis/data/model_metrics.csv` exists (synthetic generator writes it; real runs use `generate_real_data.py`).
+- `analysis/plots/7_elbow_method.png` — KMeans inertia vs. `k` on article embedding columns (requires enough articles with embeddings).
+
+Optional **live** CSVs (RSS/API + Yahoo; slower), same column layout as synthetic plus `model_metrics.csv`:
+
+`python analysis/generate_real_data.py --output-dir analysis/data_real`
+
+Then:
+
+`python analysis/plot_graphs.py --data-dir analysis/data_real --output-dir analysis/plots_real --similarity-floor 0.35`
 
 ## Pipeline architecture (7 steps)
 
