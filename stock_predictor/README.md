@@ -14,13 +14,9 @@ This project includes:
    - `source .venv/bin/activate`
 2. Install dependencies:
    - `pip install -r requirements.txt`
-3. Configure API key:
-   - `cp .env.example .env`
-   - Put your key in either `MARKETAUX_API_KEY` or `NEWS_API` in `.env`
-
-## Get a MarketAux API Key
-
-Create a free account at [MarketAux](https://www.marketaux.com/) and copy your API token into `.env`.
+3. Build the local dataset first:
+   - `./.venv/bin/python build_local_dataset.py --ticker-source all --years 8 --rss-lookback-days 3650`
+4. (Optional) copy `.env.example` to `.env` for local overrides.
 
 ## Usage
 
@@ -91,7 +87,7 @@ Outputs:
 
 1. Read user query and ticker list.
 2. Extract keywords from the query.
-3. Fetch ticker-specific paginated news from MarketAux.
+3. Fetch ticker-specific news from the local processed dataset.
 4. Rank articles using TF-IDF + cosine similarity.
 5. Run FinBERT sentiment analysis and combine with MarketAux entity sentiment.
 6. Pull historical price data and engineer technical features.
@@ -110,7 +106,7 @@ Outputs:
 
 ## Limitations and Disclaimer
 
-- MarketAux free tier limits article coverage (3 articles/request, 100 requests/day).
+- News quality depends on RSS availability and ticker mention extraction.
 - Training windows are small (~40 usable rows per ticker), so predictive power is limited.
 - Sentiment in historical training rows is approximated by current sentiment context for class-project practicality.
 - This is a class project and not financial advice.

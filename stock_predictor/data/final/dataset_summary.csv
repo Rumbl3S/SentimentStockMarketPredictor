@@ -1,0 +1,2 @@
+generated_at_utc,ticker_count,years_of_prices,rss_lookback_days,raw_news_rows,clean_news_rows,raw_price_rows,feature_price_rows,final_rows_after_cleaning,meets_50k_requirement,final_column_count
+2026-04-30T20:59:13.937809+00:00,90,8,3650,20163,33703,178979,178979,176745,True,24

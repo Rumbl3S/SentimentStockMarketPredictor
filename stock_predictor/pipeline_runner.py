@@ -73,7 +73,18 @@ def run_pipeline(
             num_pages=pages,
             top_k=top_k,
         )
-        relevant_articles = rank_articles_by_relevance(query, articles, top_k=top_k)
+        ranked_articles = rank_articles_by_relevance(query, articles, top_k=max(top_k * 3, top_k))
+        relevant_articles = [
+            a for a in ranked_articles if float(a.get("relevance_score", 0.0)) >= 0.02
+        ]
+        if len(relevant_articles) < top_k:
+            relevant_articles = ranked_articles[:top_k]
+        else:
+            relevant_articles = sorted(
+                relevant_articles,
+                key=lambda a: float(a.get("relevance_score", 0.0)),
+                reverse=True,
+            )[:top_k]
         sentiment_results = analyzer.analyze_articles(relevant_articles)
 
         try:

@@ -1,28 +1,21 @@
-"""MarketAux API integration for article retrieval."""
+"""Local dataset news retrieval (no MarketAux dependency)."""
 
 from __future__ import annotations
 
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
-import requests
-
-from config import (
-    FREE_TIER_LIMIT_PER_REQUEST,
-    MARKETAUX_API_KEY,
-    MARKETAUX_BASE_URL,
-)
+import pandas as pd
 
 API_REQUEST_COUNT = 0
-
-
-def _published_after_iso(days_back: int = 30) -> str:
-    target = datetime.utcnow() - timedelta(days=days_back)
-    return target.strftime("%Y-%m-%dT%H:%M")
+LOCAL_NEWS_PATH = (
+    Path(__file__).resolve().parent / "data" / "processed" / "news_articles_mapped.csv"
+)
 
 
 def get_api_request_count() -> int:
+    # Kept for interface compatibility; local mode uses no API requests.
     return API_REQUEST_COUNT
 
 
@@ -34,124 +27,84 @@ def reset_api_request_count() -> None:
 def fetch_articles_for_ticker(
     ticker: str, search_keywords: list[str], num_pages: int = 3, top_k: int = 3
 ) -> list[dict[str, Any]]:
-    """Fetch MarketAux articles with two-pass recall strategy for one ticker."""
-    global API_REQUEST_COUNT
-    if not MARKETAUX_API_KEY:
-        print("Warning: MARKETAUX_API_KEY/NEWS_API missing. Cannot fetch news.")
+    """Fetch ticker articles from local processed dataset."""
+    if not LOCAL_NEWS_PATH.exists():
+        print(f"Warning: local news dataset not found at {LOCAL_NEWS_PATH}")
         return []
 
-    endpoint = f"{MARKETAUX_BASE_URL}/news/all"
-    search_text = " ".join(search_keywords).strip()
     normalized_ticker = ticker.upper().strip()
-    all_articles: list[dict[str, Any]] = []
-    seen_uuids: set[str] = set()
+    news = pd.read_csv(LOCAL_NEWS_PATH)
+    if news.empty:
+        return []
 
-    def _fetch_page(page: int, use_search: bool) -> list[dict[str, Any]] | None:
-        nonlocal all_articles
-        params = {
-            "api_token": MARKETAUX_API_KEY,
-            "symbols": normalized_ticker,
-            "filter_entities": "true",
-            "must_have_entities": "true",
-            "language": "en",
-            "published_after": _published_after_iso(30),
-            "group_similar": "true",
-            "limit": FREE_TIER_LIMIT_PER_REQUEST,
-            "page": page,
-        }
-        if use_search and search_text:
-            params["search"] = search_text
-        try:
-            response = requests.get(endpoint, params=params, timeout=20)
-            # both passes count toward daily budget
-            global API_REQUEST_COUNT
-            API_REQUEST_COUNT += 1
+    required_cols = {"ticker", "title", "url", "source", "date"}
+    if not required_cols.issubset(set(news.columns)):
+        print("Warning: local news dataset is missing required columns.")
+        return []
 
-            if response.status_code == 429:
-                mode = "targeted" if use_search else "fallback"
-                print(f"  Rate limit hit for {normalized_ticker} {mode} page {page}.")
-                return None
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException as exc:
-            mode = "targeted" if use_search else "fallback"
-            print(f"  Warning: failed fetching {normalized_ticker} {mode} page {page}: {exc}")
-            return None
-        except ValueError:
-            mode = "targeted" if use_search else "fallback"
-            print(f"  Warning: non-JSON response for {normalized_ticker} {mode} page {page}.")
-            return None
+    df = news[news["ticker"].astype(str).str.upper() == normalized_ticker].copy()
+    if df.empty:
+        return []
 
-        items = payload.get("data", [])
-        mode_label = "targeted" if use_search else "fallback"
-        print(f"  Fetching {mode_label} page {page}/{num_pages}... ({len(items)} articles)")
-        if not items:
-            return []
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date", ascending=False)
 
-        for item in items:
-            article_uuid = item.get("uuid", "")
-            if article_uuid and article_uuid in seen_uuids:
-                continue
+    # Soft keyword filter first, then fallback to most recent items if too few.
+    keywords = [k.lower() for k in search_keywords if k]
+    if keywords:
+        text_blob = (
+            df["title"].fillna("")
+            + " "
+            + df.get("description", pd.Series("", index=df.index)).fillna("")
+            + " "
+            + df.get("highlight", pd.Series("", index=df.index)).fillna("")
+        ).str.lower()
 
-            entity_for_ticker = None
-            for ent in item.get("entities", []):
-                if (ent.get("symbol") or "").upper() == normalized_ticker:
-                    entity_for_ticker = ent
-                    break
+        def _kw_score(text: str) -> float:
+            if not keywords:
+                return 0.0
+            hits = sum(1 for kw in keywords if kw in text)
+            return hits / max(1, len(keywords))
 
-            highlights: list[dict[str, Any]] = []
-            if entity_for_ticker:
-                for h in entity_for_ticker.get("highlights", []):
-                    highlights.append(
-                        {
-                            "highlight": h.get("highlight", ""),
-                            "sentiment": h.get("sentiment"),
-                            "highlighted_in": h.get("highlighted_in", ""),
-                        }
-                    )
+        df["keyword_match_score"] = text_blob.map(_kw_score)
+        narrowed = df[df["keyword_match_score"] > 0]
+    else:
+        df["keyword_match_score"] = 0.0
+        narrowed = df
 
-            mapped = {
-                "uuid": article_uuid,
+    # Stage 1 retrieval: intentionally broad candidate pool.
+    limit_rows = max(120, top_k * max(1, num_pages) * 20)
+    if len(narrowed) >= top_k:
+        selected = narrowed.sort_values(
+            ["keyword_match_score", "date"], ascending=[False, False]
+        ).head(limit_rows)
+    else:
+        selected = df.sort_values("date", ascending=False).head(limit_rows)
+
+    out: list[dict[str, Any]] = []
+    for _, row in selected.iterrows():
+        published = row["date"].isoformat() if isinstance(row["date"], datetime) else str(row["date"])
+        out.append(
+            {
+                "uuid": f"local::{normalized_ticker}::{hash((row.get('url', ''), row.get('title', '')))}",
                 "ticker": normalized_ticker,
-                "title": item.get("title", ""),
-                "description": item.get("description", ""),
-                "snippet": item.get("snippet", ""),
-                "url": item.get("url", ""),
-                "source": item.get("source", ""),
-                "published_at": item.get("published_at", ""),
-                "entity_sentiment_score": (
-                    entity_for_ticker.get("sentiment_score")
-                    if entity_for_ticker
-                    else None
-                ),
-                "entity_match_score": (
-                    entity_for_ticker.get("match_score") if entity_for_ticker else None
-                ),
-                "highlights": highlights,
+                "title": str(row.get("title", "")),
+                "description": "",
+                "description": str(row.get("description", "")),
+                "snippet": str(row.get("highlight", "")),
+                "url": str(row.get("url", "")),
+                "source": str(row.get("source", "local_dataset")),
+                "published_at": published,
+                "entity_sentiment_score": float(row.get("sentiment_score", 0.0)),
+                "entity_match_score": float(row.get("keyword_match_score", 0.0)),
+                "highlights": [
+                    {
+                        "highlight": str(row.get("highlight", "")),
+                        "sentiment": float(row.get("sentiment_score", 0.0)),
+                        "highlighted_in": "main_text",
+                    }
+                ],
             }
-            all_articles.append(mapped)
-            if article_uuid:
-                seen_uuids.add(article_uuid)
-
-        time.sleep(1)
-        return items
-
-    # Pass 1: targeted fetch with search + symbol.
-    for page in range(1, max(1, num_pages) + 1):
-        fetched = _fetch_page(page=page, use_search=True)
-        if fetched is None or not fetched:
-            break
-
-    # Pass 2: fallback broadening with symbol only, if needed.
-    if len(all_articles) < max(1, top_k):
-        print(
-            f"  Pass 1 returned {len(all_articles)} articles; broadening with ticker-only fetch."
         )
-        for page in range(1, max(1, num_pages) + 1):
-            if len(all_articles) >= max(1, top_k):
-                break
-            fetched = _fetch_page(page=page, use_search=False)
-            if fetched is None or not fetched:
-                break
 
-    return all_articles
+    return out

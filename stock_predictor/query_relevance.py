@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import re
 from collections import Counter, defaultdict
 from typing import Any
@@ -76,6 +77,35 @@ def _article_text(article: dict[str, Any]) -> str:
     ).strip()
 
 
+def _parse_article_datetime(article: dict[str, Any]) -> datetime | None:
+    raw = article.get("published_at") or article.get("date") or ""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _recency_score(article: dict[str, Any], half_life_days: float = 180.0) -> float:
+    dt = _parse_article_datetime(article)
+    if dt is None:
+        return 0.5
+    age_days = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
+    # Exponential decay: 1.0 for new, ~0.5 at half-life, floor at 0.1.
+    return max(0.1, 0.5 ** (age_days / half_life_days))
+
+
+def _keyword_overlap_score(query: str, article_text: str) -> float:
+    query_terms = set(extract_keywords(query))
+    if not query_terms:
+        return 0.0
+    article_terms = set(re.findall(r"[A-Za-z][A-Za-z0-9_-]*", article_text.lower()))
+    overlap = len(query_terms.intersection(article_terms))
+    return overlap / max(1, len(query_terms))
+
+
 def rank_articles_by_relevance(
     query: str, articles: list[dict[str, Any]], top_k: int = 5
 ) -> list[dict[str, Any]]:
@@ -84,7 +114,7 @@ def rank_articles_by_relevance(
         return []
 
     corpus = [query] + [_article_text(article) for article in articles]
-    vectorizer = TfidfVectorizer(stop_words="english")
+    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), sublinear_tf=True)
     matrix = vectorizer.fit_transform(corpus)
     query_vector = matrix[0:1]
     article_vectors = matrix[1:]
@@ -92,12 +122,26 @@ def rank_articles_by_relevance(
 
     ranked = []
     for article, sim in zip(articles, similarities):
+        text = _article_text(article)
+        overlap_score = _keyword_overlap_score(query, text)
+        prior_score = float(article.get("entity_match_score", 0.0) or 0.0)
+        recency = _recency_score(article)
+        base_relevance = (0.7 * float(sim)) + (0.2 * overlap_score) + (0.1 * prior_score)
+        # Recency-aware relevance: damp stale results while keeping relevance primary.
+        blended = (0.85 * base_relevance) + (0.15 * (base_relevance * recency))
         article_copy = dict(article)
-        article_copy["relevance_score"] = float(sim)
+        article_copy["relevance_score"] = float(blended)
+        article_copy["cosine_similarity"] = float(sim)
+        article_copy["keyword_overlap_score"] = float(overlap_score)
+        article_copy["recency_score"] = float(recency)
         ranked.append(article_copy)
 
     ranked.sort(key=lambda x: x.get("relevance_score", 0.0), reverse=True)
-    return ranked[: max(1, top_k)]
+    top = ranked[: max(1, top_k)]
+    # If all scores are near-zero, keep best available items anyway.
+    if top and max(float(a.get("relevance_score", 0.0)) for a in top) < 0.01:
+        return ranked[: max(1, top_k)]
+    return top
 
 
 def cluster_articles(

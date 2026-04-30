@@ -33,6 +33,12 @@ class StockPredictor:
             float(sentiment_features.get("sentiment_std", 0.0)),
         ]
 
+    @staticmethod
+    def _sanitize_vector(values: list[float] | np.ndarray) -> np.ndarray:
+        """Ensure feature vectors contain only finite numeric values."""
+        arr = np.asarray(values, dtype=float)
+        return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
     def build_training_data(
         self, price_df: pd.DataFrame, sentiment_features: dict[str, Any]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -58,13 +64,18 @@ class StockPredictor:
             future_close = float(price_df["Close"].iloc[idx + 5])
             future_pct_change = ((future_close / current_close) - 1) * 100
 
-            rows.append(feature_row)
+            safe_row = self._sanitize_vector(feature_row).tolist()
+            rows.append(safe_row)
             y_class.append(1 if future_pct_change > 0 else 0)
             y_reg.append(future_pct_change)
 
         if not rows:
             return np.array([]), np.array([]), np.array([])
-        return np.array(rows), np.array(y_class), np.array(y_reg)
+        X = np.array(rows, dtype=float)
+        y_c = np.array(y_class, dtype=float)
+        y_r = np.array(y_reg, dtype=float)
+        valid_mask = np.isfinite(X).all(axis=1) & np.isfinite(y_c) & np.isfinite(y_r)
+        return X[valid_mask], y_c[valid_mask].astype(int), y_r[valid_mask]
 
     def train(
         self,
@@ -149,7 +160,8 @@ class StockPredictor:
         price_df: pd.DataFrame,
     ) -> dict[str, Any]:
         """Generate direction + magnitude prediction from one feature vector."""
-        x_scaled = self.scaler.transform(features.reshape(1, -1))
+        safe_features = self._sanitize_vector(features).reshape(1, -1)
+        x_scaled = self.scaler.transform(safe_features)
         class_pred = int(self.rf_classifier.predict(x_scaled)[0])
         probs = self.rf_classifier.predict_proba(x_scaled)[0]
         confidence = float(max(probs))
@@ -214,7 +226,7 @@ class StockPredictor:
         rf_accuracy = float(accuracy_score(y_class_test, class_test_pred))
         lr_r2 = float(r2_score(y_reg_test, reg_test_pred))
 
-        latest_features = np.array(
+        latest_features = self._sanitize_vector(
             self._sentiment_vector(sentiment_results)
             + [
                 float(price_data["returns_5d"]),
