@@ -1,4 +1,4 @@
-"""Generate synthetic but realistic test data for analysis plots (Polars I/O)."""
+"""Synthetic analysis CSVs for plot scripts (Polars)."""
 
 from __future__ import annotations
 

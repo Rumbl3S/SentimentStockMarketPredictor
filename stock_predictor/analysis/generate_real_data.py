@@ -1,9 +1,4 @@
-"""Generate analysis CSVs by running the live pipeline (news, sentiment, prices, models).
-
-Writes the same filenames as ``generate_test_data`` under ``--output-dir``, plus
-``model_metrics.csv`` with RandomForest vs dummy vs logistic on the held-out slice
-(after the same winsorize + correlation mask used in ``StockPredictor.run_prediction``).
-"""
+"""Run the live pipeline and write analysis CSVs (same layout as ``generate_test_data``)."""
 
 from __future__ import annotations
 
@@ -65,7 +60,6 @@ def evaluate_baselines_after_run(
     price_df: pl.DataFrame,
     sentiment: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """Compare tuned RF (already fit) to dummy and logistic on the same preprocessed test matrix."""
     X, y_class, _ = predictor.build_training_data(price_df, sentiment)
     if len(X) < 10 or predictor._rf_best is None:
         return []
@@ -184,7 +178,7 @@ def main() -> None:
     parser.add_argument("--pages", type=int, default=2)
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--history-days", type=int, default=HISTORICAL_DAYS)
-    parser.add_argument("--n-clusters", type=int, default=4, help="KMeans clusters for TF-IDF article vectors.")
+    parser.add_argument("--n-clusters", type=int, default=5, help="KMeans clusters for TF-IDF article vectors.")
     parser.add_argument("--embedding-dim", type=int, default=64, help="TF-IDF max features for embeddings.")
     args = parser.parse_args()
 

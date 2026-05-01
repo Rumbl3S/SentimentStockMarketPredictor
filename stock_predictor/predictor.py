@@ -1,4 +1,4 @@
-"""ML prediction: Polars price frames, train-only preprocessing, HP tuning, imbalance-aware metrics."""
+"""Train and run direction (RF) and magnitude (Ridge) models on price + sentiment features."""
 
 from __future__ import annotations
 

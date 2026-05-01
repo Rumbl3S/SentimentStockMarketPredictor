@@ -20,7 +20,6 @@ def correlation_pruning_mask(X: np.ndarray, threshold: float = 0.95) -> np.ndarr
     """Return boolean mask of columns to keep; drops later column of each highly correlated pair (train only)."""
     if X.shape[1] <= 1:
         return np.ones(X.shape[1], dtype=bool)
-    # Correlation across samples; suppress warnings for constant cols
     with np.errstate(invalid="ignore"):
         corr = np.abs(np.corrcoef(X.astype(np.float64), rowvar=False))
     corr = np.nan_to_num(corr, nan=0.0)

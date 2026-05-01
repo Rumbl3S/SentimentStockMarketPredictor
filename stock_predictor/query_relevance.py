@@ -49,17 +49,15 @@ def extract_keywords(query: str) -> list[str]:
     keywords = [t for t in tokens if t not in ENGLISH_STOP_WORDS and len(t) > 1]
     if not keywords:
         return tokens[:4]
-    # Keep a richer keyword set for local TF-IDF re-ranking.
     return list(dict.fromkeys(keywords))[:12]
 
 
 def build_api_search_keywords(keywords: list[str], min_terms: int = 2, max_terms: int = 3) -> list[str]:
-    """Pick specific terms for MarketAux search; exclude generic finance noise."""
+    """Narrow query terms for news search; drop generic finance words when possible."""
     deduped = [k for k in dict.fromkeys(keywords) if k]
     specific = [k for k in deduped if k not in GENERIC_FINANCE_TERMS]
     if len(specific) >= min_terms:
         return specific[:max_terms]
-    # Fallback if query is mostly generic terms.
     return deduped[:max_terms]
 
 
@@ -93,7 +91,6 @@ def _recency_score(article: dict[str, Any], half_life_days: float = 180.0) -> fl
     if dt is None:
         return 0.5
     age_days = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
-    # Exponential decay: 1.0 for new, ~0.5 at half-life, floor at 0.1.
     return max(0.1, 0.5 ** (age_days / half_life_days))
 
 
@@ -127,7 +124,6 @@ def rank_articles_by_relevance(
         prior_score = float(article.get("entity_match_score", 0.0) or 0.0)
         recency = _recency_score(article)
         base_relevance = (0.7 * float(sim)) + (0.2 * overlap_score) + (0.1 * prior_score)
-        # Recency-aware relevance: damp stale results while keeping relevance primary.
         blended = (0.85 * base_relevance) + (0.15 * (base_relevance * recency))
         article_copy = dict(article)
         article_copy["relevance_score"] = float(blended)
@@ -138,7 +134,6 @@ def rank_articles_by_relevance(
 
     ranked.sort(key=lambda x: x.get("relevance_score", 0.0), reverse=True)
     top = ranked[: max(1, top_k)]
-    # If all scores are near-zero, keep best available items anyway.
     if top and max(float(a.get("relevance_score", 0.0)) for a in top) < 0.01:
         return ranked[: max(1, top_k)]
     return top

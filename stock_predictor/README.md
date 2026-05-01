@@ -5,7 +5,7 @@ This project includes:
 - A lightweight Flask API (`/api/predict`) exposing the same pipeline.
 - A React frontend with two interfaces:
   - input page for model parameters
-  - transparency-focused results page showing ranking, sentiment, and blend math
+  - results page with ranking, sentiment, and blend breakdown
 
 ## Setup
 
@@ -83,7 +83,7 @@ Generate synthetic test data (includes `model_metrics.csv` for model comparison)
 
 Create analysis graphs (plots 1–5 always; **6** and **7** when inputs allow):
 
-`python analysis/plot_graphs.py --data-dir analysis/data --output-dir analysis/plots --similarity-floor 0.35` (embedding KMeans defaults to **4** clusters; override with `--n-clusters`.)
+`python analysis/plot_graphs.py --data-dir analysis/data --output-dir analysis/plots --similarity-floor 0.35` (embedding KMeans defaults to **5** clusters; override with `--n-clusters`.)
 
 Outputs:
 - `analysis/plots/1_finbert_sentiment_distribution.png`
@@ -112,11 +112,11 @@ Then:
 6. Pull historical price data and engineer technical features (**Polars** in `price_fetcher.py`).
 7. **Preprocess**, **tune hyperparameters** (train only), evaluate with **multiple metrics**, then blend predictions for the summary.
 
-## Pre-processing, feature engineering, tuning, and metrics (what improved)
+## Pre-processing, feature engineering, tuning, and metrics
 
 | Area | Before | After |
 |------|--------|--------|
-| **Tables** | pandas-heavy pipelines | **Polars** for build, news read, prices, joins, and aggregations (faster, clearer lazy-friendly patterns, aligns with course “Polars” topic). |
+| **Tables** | pandas-heavy pipelines | **Polars** for build, news read, prices, joins, and aggregations. |
 | **Outliers / heavy tails** | ad hoc `nan_to_num` only | **Winsorization** at the 1st/99th percentile **fit on the training split only**, then applied to train, test, and the live feature row—reduces leverage from extreme returns/volume without peeking at the test split. |
 | **Redundant features** | all columns always used | **Correlation pruning** on the training matrix (drop one column of each pair with \|r\| ≥ 0.95) to reduce multicollinearity before scaling/tuning. |
 | **Scaling** | `StandardScaler` fit on train | unchanged principle: scaling lives **inside** each sklearn `Pipeline` during `RandomizedSearchCV`, so CV folds do not leak statistics from validation folds. |
@@ -124,7 +124,7 @@ Then:
 | **Class imbalance** | ignored | **Report** minority fraction on the training labels; if the minority share is **below 35%**, treat as “severe”: RF search optimizes **F1**, `class_weight` options include **balanced**, and the sentiment blend uses **F1** instead of raw accuracy as the reliability score. |
 | **Metrics** | accuracy + R² only | Still report those, plus **binary F1** for direction (better when UP/DOWN counts differ) and **MAE** for the Ridge target (5-day % move in percentage points—interpretable error size). |
 
-Together, these changes better match typical rubric expectations: explicit preprocessing choices, no standardizer fit on test data, documented imbalance handling, more than one evaluation metric, and methodical hyperparameter search tied to the objective (F1 when imbalanced, negative MAE for regression tuning).
+Together: preprocessing fit only on training data, imbalance-aware tuning when labels are skewed, multiple metrics (accuracy, F1, MAE, R² as applicable), and hyperparameter search aligned with those objectives.
 
 ## ML concepts used
 

@@ -23,7 +23,7 @@ def _safe_date(iso_string: str) -> str:
 
 
 def clean_highlight(text: str) -> str:
-    """Clean up MarketAux highlight text for display."""
+    """Strip markup from API highlight snippets."""
     cleaned = re.sub(r"</?em>", "", text or "", flags=re.IGNORECASE)
     cleaned = re.sub(r"\[\+\d+ characters?\]", "...", cleaned)
     cleaned = re.sub(r"<[^>]*$", "", cleaned)

@@ -19,7 +19,7 @@ export function ResultsPage() {
       <main className="container">
         <section className="card">
           <h1>No Results Yet</h1>
-          <p className="subtitle">Run a prediction first so this page can show explainability details.</p>
+          <p className="subtitle">Run a prediction from the home page first.</p>
           <Link to="/">Go to homepage</Link>
         </section>
       </main>
@@ -29,7 +29,7 @@ export function ResultsPage() {
   return (
     <main className="container">
       <header className="card hero-card">
-        <h1>Prediction Transparency View</h1>
+        <h1>Prediction results</h1>
         <p className="subtitle">Query: {data.inputs.query}</p>
         <p><strong>Keywords:</strong> {data.inputs.keywords.join(', ') || 'none'}</p>
         <p><strong>API search terms:</strong> {data.inputs.api_keywords.join(', ') || 'none'}</p>

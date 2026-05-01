@@ -1,9 +1,4 @@
-"""Local dataset news retrieval (no MarketAux dependency). Polars I/O.
-
-Falls back to live Google News RSS for the requested ticker when the local
-mapped CSV has no rows for that symbol (e.g. ticker was not in the dataset
-build universe, or the last build predates caring about that name).
-"""
+"""News rows from the local mapped CSV, with optional live RSS fallback."""
 
 from __future__ import annotations
 
@@ -18,7 +13,6 @@ LOCAL_NEWS_PATH = (
     Path(__file__).resolve().parent / "data" / "processed" / "news_articles_mapped.csv"
 )
 
-# Lazy import target for RSS reuse (same queries as dataset build).
 _build_rss_module: Any = None
 
 
@@ -66,7 +60,6 @@ def _live_rss_fallback_frame(normalized_ticker: str, lookback_days: int = 3650) 
 
     fb = pl.DataFrame(mapped)
     pub = pl.col("published_at")
-    # Polars requires time_zone when strings include offsets; coalesce handles plain dates.
     date_from_iso = pub.str.to_datetime(time_zone="UTC", strict=False).dt.date()
     date_from_prefix = pub.str.slice(0, 10).str.to_date("%Y-%m-%d", strict=False)
     return fb.with_columns(
